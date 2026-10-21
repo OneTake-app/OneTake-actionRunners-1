@@ -32,6 +32,8 @@ env:
 
 jobs:
   start:
+    # Paused (owner ruling 2026-10-21) unless this repository's variable LINUX_ONLY is false; nothing is deleted.
+    if: vars.LINUX_ONLY == 'false'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
