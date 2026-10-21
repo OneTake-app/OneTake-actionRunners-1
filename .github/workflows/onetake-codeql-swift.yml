@@ -35,6 +35,8 @@ env:
 
 jobs:
   start:
+    # Paused (owner ruling 2026-10-21) unless this repository's variable CODEQL_PAUSED is false; nothing is deleted.
+    if: vars.CODEQL_PAUSED == 'false'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
