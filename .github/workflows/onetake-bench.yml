@@ -1,7 +1,8 @@
 name: onetake-bench
 # agentbot (marshiyar/oneTake .github/ci/agentbot.py) reads this run-name to find main's baselines and pull requests'
-# runs: "onetake-bench <kind> <sha>". A payload the start job refuses never ends in success, so it is never read.
-run-name: onetake-bench ${{ github.event.client_payload.kind }} ${{ github.event.client_payload.sha }}
+# runs: "onetake-bench <kind> <sha> <head>" (a pull request's run is bound to the head it benchmarked). A payload the
+# start job refuses never ends in success, so it is never read.
+run-name: onetake-bench ${{ github.event.client_payload.kind }} ${{ github.event.client_payload.sha }} ${{ github.event.client_payload.head }}
 
 # Runs marshiyar/oneTake's Linux and macOS benchmarks on this organization's runners, so they no longer queue in
 # oneTake's own pool (its Windows benchmark stays there).
