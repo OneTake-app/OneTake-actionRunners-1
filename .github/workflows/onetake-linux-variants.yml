@@ -1,0 +1,128 @@
+name: onetake-linux-variants
+
+# Runs marshiyar/oneTake's two Linux build variants on this organization's runners: the build without the Vulkan
+# headers (linux-no-vulkan.yml) and the build without the optional Vulkan and PulseAudio headers
+# (linux-optional-headers.yml). Each oneTake workflow's runners job sends its own repository_dispatch and then skips
+# its local build job. This workflow:
+#   start:  checks the payload and sets the commit status `<variant> build (runners-1)` on the oneTake commit to
+#           pending;
+#   build:  calls that variant's generated <variant>-source.yml on the commit, with no secrets and a read-only token;
+#   report: sets the status to the result.
+#
+# Secrets: RUNNERS_APP_ID and RUNNERS_APP_PRIVATE_KEY (the oneTake-Runners1 App). Only start and report use them.
+
+on:
+  repository_dispatch:
+    types: [onetake-linux-no-vulkan, onetake-linux-optional-headers]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: onetake-linux-variants-${{ github.event.action }}-${{ github.event.client_payload.sha }}
+  cancel-in-progress: false
+
+env:
+  SOURCE: marshiyar/oneTake
+
+jobs:
+  start:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.check.outputs.sha }}
+      head: ${{ steps.check.outputs.head }}
+      variant: ${{ steps.check.outputs.variant }}
+    steps:
+      - name: Check the payload
+        id: check
+        env:
+          ACTION: ${{ github.event.action }}
+          REPO: ${{ github.event.client_payload.repository }}
+          SHA: ${{ github.event.client_payload.sha }}
+          HEAD: ${{ github.event.client_payload.head }}
+          RUN: ${{ github.event.client_payload.run }}
+        run: |
+          case "$ACTION" in
+            onetake-linux-no-vulkan) variant=linux-no-vulkan ;;
+            onetake-linux-optional-headers) variant=linux-optional-headers ;;
+            *) echo "::error::event type '$ACTION' is not a Linux variant"; exit 1 ;;
+          esac
+          [ "$REPO" = "$SOURCE" ] || { echo "::error::payload repository '$REPO' is not $SOURCE"; exit 1; }
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::payload sha is not a full commit sha"; exit 1; }
+          [[ "$HEAD" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::payload head is not a full commit sha"; exit 1; }
+          [[ "$RUN" =~ ^[0-9]{1,20}/[0-9]{1,4}$ ]] || { echo "::error::payload run is not <run id>/<attempt>"; exit 1; }
+          { echo "sha=$SHA"; echo "head=$HEAD"; echo "variant=$variant"; } >> "$GITHUB_OUTPUT"
+          echo "oneTake run $RUN: $variant build of $SHA" >> "$GITHUB_STEP_SUMMARY"
+      - name: oneTake App token
+        id: token
+        continue-on-error: true   # not installed on marshiyar/oneTake: the work still runs, without statuses
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.RUNNERS_APP_ID }}
+          private-key: ${{ secrets.RUNNERS_APP_PRIVATE_KEY }}
+          owner: marshiyar
+          repositories: oneTake
+          permission-statuses: write
+      - name: Status pending
+        if: steps.token.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          SHA: ${{ steps.check.outputs.head }}
+          VARIANT: ${{ steps.check.outputs.variant }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh api -X POST "repos/$SOURCE/statuses/$SHA" -f state=pending -f context="$VARIANT build (runners-1)" \
+            -f description="building on OneTake-actionRunners-1" -f target_url="$RUN" > /dev/null
+
+  no-vulkan:
+    needs: start
+    if: needs.start.outputs.variant == 'linux-no-vulkan'
+    uses: marshiyar/oneTake/.github/workflows/linux-no-vulkan-source.yml@main
+    with:
+      source_repository: marshiyar/oneTake
+      source_ref: ${{ needs.start.outputs.sha }}
+
+  optional-headers:
+    needs: start
+    if: needs.start.outputs.variant == 'linux-optional-headers'
+    uses: marshiyar/oneTake/.github/workflows/linux-optional-headers-source.yml@main
+    with:
+      source_repository: marshiyar/oneTake
+      source_ref: ${{ needs.start.outputs.sha }}
+
+  report:
+    needs: [start, no-vulkan, optional-headers]
+    if: always() && needs.start.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: oneTake App token
+        id: token
+        continue-on-error: true   # not installed on marshiyar/oneTake: the work still runs, without statuses
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.RUNNERS_APP_ID }}
+          private-key: ${{ secrets.RUNNERS_APP_PRIVATE_KEY }}
+          owner: marshiyar
+          repositories: oneTake
+          permission-statuses: write
+      - name: No token, no status
+        if: steps.token.outcome != 'success'
+        run: echo "::warning::no oneTake-Runners1 App token for marshiyar/oneTake (is the App installed on that repository?); the build ran here, but status was not set"
+      - name: Status result
+        if: steps.token.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          SHA: ${{ needs.start.outputs.head }}
+          VARIANT: ${{ needs.start.outputs.variant }}
+          RESULT: ${{ needs.start.outputs.variant == 'linux-no-vulkan' && needs.no-vulkan.result || needs.optional-headers.result }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          case "$RESULT" in
+            success) state=success desc="build passed" ;;
+            cancelled) state=error desc="build was cancelled" ;;
+            *) state=failure desc="build ended $RESULT" ;;
+          esac
+          gh api -X POST "repos/$SOURCE/statuses/$SHA" -f state="$state" -f context="$VARIANT build (runners-1)" \
+            -f description="$desc" -f target_url="$RUN" > /dev/null

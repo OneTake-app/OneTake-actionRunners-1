@@ -1,0 +1,153 @@
+name: onetake-test-shards
+
+# Runs some of marshiyar/oneTake's Linux test shards on this organization's runners, so they no longer queue in
+# oneTake's own pool. Which ones is oneTake's choice (.github/ci/test-shards.py RUNNERS); oneTake's plan job takes them
+# out of its own linux-test, so each shard runs in one place.
+#
+# oneTake's mpvfx-ci.yml (job remote-shards) sends a repository_dispatch `onetake-test-shards` with the shard names,
+# the commit to test and its run id/attempt, then waits for one commit status per shard and fails ci-ok if one fails,
+# errors or never reports. This workflow:
+#   start:  checks the payload and sets `linux test (<shard>) (runners-1)` to pending on the oneTake head commit;
+#   tests:  calls oneTake's mpvfx-ci-tests-source.yml (its linux-test job, generated) on that commit with no secrets
+#           and a read-only token;
+#   report: reads this run's jobs and sets each shard's status to its job's result. Every description ends with
+#           "oneTake run <run id>/<attempt>": the waiting oneTake job counts only statuses that name its own run.
+#
+# Secrets: RUNNERS_APP_ID and RUNNERS_APP_PRIVATE_KEY (the oneTake-Runners1 App). Only start and report use them. If
+# the App token cannot be made (the App is not installed on marshiyar/oneTake), the tests still run; no status is set,
+# and the report job says why.
+
+on:
+  repository_dispatch:
+    types: [onetake-test-shards]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: onetake-test-shards-${{ github.event.client_payload.sha }}-${{ github.event.client_payload.run }}
+  cancel-in-progress: false
+
+env:
+  SOURCE: marshiyar/oneTake
+
+jobs:
+  start:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.check.outputs.sha }}
+      head: ${{ steps.check.outputs.head }}
+      run: ${{ steps.check.outputs.run }}
+      linux: ${{ steps.check.outputs.linux }}
+    steps:
+      - name: Check the payload
+        id: check
+        env:
+          REPO: ${{ github.event.client_payload.repository }}
+          SHA: ${{ github.event.client_payload.sha }}
+          HEAD: ${{ github.event.client_payload.head }}
+          RUN: ${{ github.event.client_payload.run }}
+          LINUX: ${{ toJSON(github.event.client_payload.linux) }}
+          WINDOWS: ${{ toJSON(github.event.client_payload.windows) }}
+        run: |
+          [ "$REPO" = "$SOURCE" ] || { echo "::error::payload repository '$REPO' is not $SOURCE"; exit 1; }
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::payload sha is not a full commit sha"; exit 1; }
+          [[ "$HEAD" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::payload head is not a full commit sha"; exit 1; }
+          [[ "$RUN" =~ ^[0-9]{1,20}/[0-9]{1,4}$ ]] || { echo "::error::payload run is not <run id>/<attempt>"; exit 1; }
+          # A list of 1 to 4 distinct shard names; oneTake's generated plan job refuses a name test-shards.py lacks.
+          linux=$(jq -ce 'if type == "array" and length >= 1 and length <= 4 and (map(type == "string" and test("^[a-z][a-z-]{0,30}$")) | all) and (unique | length) == length then . else error("bad") end' <<< "$LINUX") ||
+            { echo "::error::payload linux is not a list of shard names"; exit 1; }
+          # Windows shards are not run here (their setup-swift pin has no version to name); the list must be empty.
+          jq -e '. == null or . == []' <<< "$WINDOWS" > /dev/null || { echo "::error::payload windows must be empty: Windows shards run in oneTake"; exit 1; }
+          { echo "sha=$SHA"; echo "head=$HEAD"; echo "run=$RUN"; echo "linux=$linux"; } >> "$GITHUB_OUTPUT"
+          echo "oneTake run $RUN: linux shards $linux of $SHA" >> "$GITHUB_STEP_SUMMARY"
+      - name: oneTake App token
+        id: token
+        continue-on-error: true   # without it the shards still run; the report job warns
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.RUNNERS_APP_ID }}
+          private-key: ${{ secrets.RUNNERS_APP_PRIVATE_KEY }}
+          owner: marshiyar
+          repositories: oneTake
+          permission-statuses: write
+      - name: Statuses pending
+        if: steps.token.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          SHA: ${{ steps.check.outputs.head }}
+          SHARDS: ${{ steps.check.outputs.linux }}
+          ONETAKE_RUN: ${{ steps.check.outputs.run }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          for s in $(jq -r '.[]' <<< "$SHARDS"); do
+            gh api -X POST "repos/$SOURCE/statuses/$SHA" -f state=pending -f context="linux test ($s) (runners-1)" \
+              -f description="queued on OneTake-actionRunners-1; oneTake run $ONETAKE_RUN" -f target_url="$RUN" > /dev/null
+          done
+
+  tests:
+    needs: start
+    uses: marshiyar/oneTake/.github/workflows/mpvfx-ci-tests-source.yml@main
+    with:
+      source_repository: marshiyar/oneTake
+      source_ref: ${{ needs.start.outputs.sha }}
+      linux_shards: ${{ needs.start.outputs.linux }}
+
+  report:
+    needs: [start, tests]
+    if: always() && needs.start.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read   # this run's own jobs
+    steps:
+      - name: Each shard's result
+        id: results
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHARDS: ${{ needs.start.outputs.linux }}
+          TESTS: ${{ needs.tests.result }}
+        run: |
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs" \
+            --jq '.jobs[] | select(.name | test("linux test \\([a-z-]+\\)$")) | [(.name | capture("linux test \\((?<s>[a-z-]+)\\)$").s), (.conclusion // "cancelled")] | @tsv' > "$RUNNER_TEMP/jobs.tsv"
+          cat "$RUNNER_TEMP/jobs.tsv"
+          # A shard asked for with no job of its own did not run (the plan job or the call failed): that is a failure.
+          for s in $(jq -r '.[]' <<< "$SHARDS"); do
+            c=$(awk -F'\t' -v s="$s" '$1 == s { print $2 }' "$RUNNER_TEMP/jobs.tsv" | tail -1)
+            echo "$s ${c:-missing}"
+          done > "$RUNNER_TEMP/results.txt"
+          cat "$RUNNER_TEMP/results.txt" >> "$GITHUB_STEP_SUMMARY"
+          echo "tests call: $TESTS" >> "$GITHUB_STEP_SUMMARY"
+      - name: oneTake App token
+        id: token
+        continue-on-error: true
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.RUNNERS_APP_ID }}
+          private-key: ${{ secrets.RUNNERS_APP_PRIVATE_KEY }}
+          owner: marshiyar
+          repositories: oneTake
+          permission-statuses: write
+      - name: No token, no statuses
+        if: steps.token.outcome != 'success'
+        run: echo "::warning::no oneTake-Runners1 App token for marshiyar/oneTake (is the App installed on that repository?); the shards ran, but no commit status was set, so oneTake's remote-shards job will time out"
+      - name: Statuses result
+        if: steps.token.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          SHA: ${{ needs.start.outputs.head }}
+          ONETAKE_RUN: ${{ needs.start.outputs.run }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          while read -r s c; do
+            case "$c" in
+              success) state=success desc="passed" ;;
+              cancelled) state=error desc="cancelled" ;;
+              missing) state=failure desc="did not run" ;;
+              *) state=failure desc="ended $c" ;;
+            esac
+            gh api -X POST "repos/$SOURCE/statuses/$SHA" -f state="$state" -f context="linux test ($s) (runners-1)" \
+              -f description="$desc on OneTake-actionRunners-1; oneTake run $ONETAKE_RUN" -f target_url="$RUN" > /dev/null
+          done < "$RUNNER_TEMP/results.txt"

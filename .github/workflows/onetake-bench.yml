@@ -1,0 +1,145 @@
+name: onetake-bench
+# agentbot (marshiyar/oneTake .github/ci/agentbot.py) reads this run-name to find main's baselines and pull requests'
+# runs: "onetake-bench <kind> <sha>". A payload the start job refuses never ends in success, so it is never read.
+run-name: onetake-bench ${{ github.event.client_payload.kind }} ${{ github.event.client_payload.sha }}
+
+# Runs marshiyar/oneTake's Linux and macOS benchmarks on this organization's runners, so they no longer queue in
+# oneTake's own pool (its Windows benchmark stays there).
+#
+# oneTake's bench.yml (job runners) sends a repository_dispatch `onetake-bench` for main after green CI, its weekly run,
+# a dispatch, and pull requests from its own branches, and then skips its local linux and macos jobs. This workflow:
+#   start:  checks the payload and sets the commit status `bench (runners-1)` on the oneTake commit to pending;
+#   bench:  calls oneTake's bench-source.yml (bench.yml's linux and macos jobs, generated) on that commit with no
+#           secrets and a read-only token; the bench-linux and bench-macos artifacts stay in this run (90 days);
+#   report: sets the status to the result and, for a pull request, sends repository_dispatch `runners-bench` to oneTake
+#           (this run's id, the pull request, its head) so agentbot posts the comparison with main.
+#
+# Secrets: RUNNERS_APP_ID and RUNNERS_APP_PRIVATE_KEY (the oneTake-Runners1 App). Only start and report use them.
+
+on:
+  repository_dispatch:
+    types: [onetake-bench]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: onetake-bench-${{ github.event.client_payload.sha }}
+  cancel-in-progress: false
+
+env:
+  SOURCE: marshiyar/oneTake
+  CONTEXT: bench (runners-1)
+
+jobs:
+  start:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.check.outputs.sha }}
+      head: ${{ steps.check.outputs.head }}
+      kind: ${{ steps.check.outputs.kind }}
+      pr: ${{ steps.check.outputs.pr }}
+      runs: ${{ steps.check.outputs.runs }}
+      only: ${{ steps.check.outputs.only }}
+    steps:
+      - name: Check the payload
+        id: check
+        env:
+          REPO: ${{ github.event.client_payload.repository }}
+          SHA: ${{ github.event.client_payload.sha }}
+          HEAD: ${{ github.event.client_payload.head }}
+          KIND: ${{ github.event.client_payload.kind }}
+          PR: ${{ github.event.client_payload.pr }}
+          RUNS: ${{ github.event.client_payload.runs }}
+          ONLY: ${{ github.event.client_payload.only }}
+          RUN: ${{ github.event.client_payload.run }}
+        run: |
+          [ "$REPO" = "$SOURCE" ] || { echo "::error::payload repository '$REPO' is not $SOURCE"; exit 1; }
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::payload sha is not a full commit sha"; exit 1; }
+          [[ "$HEAD" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::payload head is not a full commit sha"; exit 1; }
+          case "$KIND" in
+            pr) [[ "$PR" =~ ^[0-9]{1,7}$ ]] || { echo "::error::payload kind pr needs a pull request number"; exit 1; } ;;
+            main|branch) [ -z "$PR" ] || { echo "::error::payload kind $KIND carries a pull request"; exit 1; } ;;
+            *) echo "::error::payload kind '$KIND' is not pr, main or branch"; exit 1 ;;
+          esac
+          [[ "$RUNS" =~ ^[1-9][0-9]?$ ]] || { echo "::error::payload runs is not 1 to 99"; exit 1; }
+          [[ "$ONLY" =~ ^[a-z,]{0,40}$ ]] || { echo "::error::payload only is not a comma list of benchmark names"; exit 1; }
+          [[ "$RUN" =~ ^[0-9]{1,20}/[0-9]{1,4}$ ]] || { echo "::error::payload run is not <run id>/<attempt>"; exit 1; }
+          { echo "sha=$SHA"; echo "head=$HEAD"; echo "kind=$KIND"; echo "pr=$PR"; echo "runs=$RUNS"; echo "only=$ONLY"; } >> "$GITHUB_OUTPUT"
+          echo "oneTake run $RUN: bench $SHA ($KIND${PR:+ #$PR})" >> "$GITHUB_STEP_SUMMARY"
+      - name: oneTake App token
+        id: token
+        continue-on-error: true   # not installed on marshiyar/oneTake: the work still runs, without statuses
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.RUNNERS_APP_ID }}
+          private-key: ${{ secrets.RUNNERS_APP_PRIVATE_KEY }}
+          owner: marshiyar
+          repositories: oneTake
+          permission-statuses: write
+      - name: Status pending
+        if: steps.token.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          SHA: ${{ steps.check.outputs.head }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh api -X POST "repos/$SOURCE/statuses/$SHA" -f state=pending -f context="$CONTEXT" \
+            -f description="benchmarking on OneTake-actionRunners-1" -f target_url="$RUN" > /dev/null
+
+  bench:
+    needs: start
+    uses: marshiyar/oneTake/.github/workflows/bench-source.yml@main
+    with:
+      source_repository: marshiyar/oneTake
+      source_ref: ${{ needs.start.outputs.sha }}
+      runs: ${{ fromJSON(needs.start.outputs.runs) }}
+      only: ${{ needs.start.outputs.only }}
+
+  report:
+    needs: [start, bench]
+    if: always() && needs.start.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: oneTake App token
+        id: token
+        continue-on-error: true   # not installed on marshiyar/oneTake: the work still runs, without statuses
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.RUNNERS_APP_ID }}
+          private-key: ${{ secrets.RUNNERS_APP_PRIVATE_KEY }}
+          owner: marshiyar
+          repositories: oneTake
+          permission-statuses: write
+          permission-contents: write   # repository_dispatch `runners-bench` back to oneTake
+      - name: No token, no status or agentbot request
+        if: steps.token.outcome != 'success'
+        run: echo "::warning::no oneTake-Runners1 App token for marshiyar/oneTake (is the App installed on that repository?); the benchmarks ran here, but status or agentbot request was not set"
+      - name: Status result
+        if: steps.token.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          SHA: ${{ needs.start.outputs.head }}
+          RESULT: ${{ needs.bench.result }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          case "$RESULT" in
+            success) state=success desc="Linux and macOS benchmarks done (artifacts in this run)" ;;
+            cancelled) state=error desc="bench run was cancelled" ;;
+            *) state=failure desc="bench ended $RESULT" ;;
+          esac
+          gh api -X POST "repos/$SOURCE/statuses/$SHA" -f state="$state" -f context="$CONTEXT" \
+            -f description="$desc" -f target_url="$RUN" > /dev/null
+      - name: Ask oneTake's agentbot to compare the pull request with main
+        if: steps.token.outcome == 'success' && needs.start.outputs.kind == 'pr'
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          PR: ${{ needs.start.outputs.pr }}
+          HEAD: ${{ needs.start.outputs.head }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          jq -n --arg run "$RUN_ID" --arg pr "$PR" --arg sha "$HEAD" \
+            '{event_type: "runners-bench", client_payload: {run: $run, pr: $pr, sha: $sha}}' |
+            gh api -X POST "repos/$SOURCE/dispatches" --input -
