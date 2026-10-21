@@ -36,6 +36,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
+      current: ${{ steps.current.outputs.current }}
       sha: ${{ steps.check.outputs.sha }}
       head: ${{ steps.check.outputs.head }}
       run: ${{ steps.check.outputs.run }}
@@ -62,8 +63,26 @@ jobs:
           jq -e '. == null or . == []' <<< "$WINDOWS" > /dev/null || { echo "::error::payload windows must be empty: Windows shards run in oneTake"; exit 1; }
           { echo "sha=$SHA"; echo "head=$HEAD"; echo "run=$RUN"; echo "linux=$linux"; } >> "$GITHUB_OUTPUT"
           echo "oneTake run $RUN: linux shards $linux of $SHA" >> "$GITHUB_STEP_SUMMARY"
+      - name: Still the newest commit
+        id: current
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD: ${{ steps.check.outputs.head }}
+        run: |
+          # A commit that a newer push replaced is not built: oneTake's own run for it was cancelled by that push, so
+          # nothing waits for this one. Replaced = it belongs to pull requests, is none of their open heads and is not
+          # on main. Anything else, and any API failure, builds.
+          current=true
+          if prs=$(gh api "repos/$SOURCE/commits/$HEAD/pulls" --jq "[length, ([.[] | select(.state == \"open\" and .head.sha == \"$HEAD\")] | length)] | @tsv") &&
+             onmain=$(gh api "repos/$SOURCE/compare/$HEAD...main" --jq .status); then
+            read -r all open <<< "$prs"
+            if [ "$all" -gt 0 ] && [ "$open" = 0 ] && [ "$onmain" != ahead ] && [ "$onmain" != identical ]; then current=false; fi
+          fi
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          [ "$current" = true ] || echo "$HEAD was replaced by a newer push: skipped" >> "$GITHUB_STEP_SUMMARY"
       - name: oneTake App token
         id: token
+        if: steps.current.outputs.current == 'true'
         continue-on-error: true   # without it the shards still run; the report job warns
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
@@ -88,6 +107,7 @@ jobs:
 
   tests:
     needs: start
+    if: needs.start.outputs.current == 'true'
     uses: marshiyar/oneTake/.github/workflows/mpvfx-ci-tests-source.yml@main
     with:
       source_repository: marshiyar/oneTake
@@ -96,7 +116,7 @@ jobs:
 
   report:
     needs: [start, tests]
-    if: always() && needs.start.result == 'success'
+    if: always() && needs.start.result == 'success' && needs.start.outputs.current == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
