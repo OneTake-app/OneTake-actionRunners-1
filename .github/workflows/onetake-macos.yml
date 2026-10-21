@@ -6,7 +6,7 @@ name: onetake-macos
 # oneTake's mpvfx-ci.yml (job macos-runners) sends a repository_dispatch `onetake-macos` with the commit to build and
 # whether it is a main push (kind nightly) or a labelled pull request (kind pr). This workflow:
 #   start:  checks the payload and sets the commit status `macos (runners-1)` on that oneTake commit to pending;
-#   macos:  calls oneTake's own mpvfx-macos.yml on that commit (package and test shards), with no secrets, so the disk
+#   macos:  calls oneTake's mpvfx-macos-source.yml (generated from mpvfx-macos.yml: no caches, no secrets) on that commit (package and test shards), with no secrets, so the disk
 #           image is ad-hoc signed and nothing here can notarize or log in to Apple;
 #   report: sets the status to the result and, for a nightly that passed, uploads the disk image into oneTake's
 #           nightly-<short sha> release (created if oneTake's publish job has not made it yet).
@@ -68,7 +68,7 @@ jobs:
 
   macos:
     needs: start
-    uses: marshiyar/oneTake/.github/workflows/mpvfx-macos.yml@main
+    uses: marshiyar/oneTake/.github/workflows/mpvfx-macos-source.yml@main
     with:
       source_repository: marshiyar/oneTake
       source_ref: ${{ needs.start.outputs.sha }}
