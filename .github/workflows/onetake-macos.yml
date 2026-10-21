@@ -1,0 +1,129 @@
+name: onetake-macos
+
+# Runs marshiyar/oneTake's macOS build and tests on this organization's GitHub-hosted runners, which are a separate
+# pool from the oneTake owner's, so macOS work no longer queues behind oneTake's own jobs.
+#
+# oneTake's mpvfx-ci.yml (job macos-runners) sends a repository_dispatch `onetake-macos` with the commit to build and
+# whether it is a main push (kind nightly) or a labelled pull request (kind pr). This workflow:
+#   start:  checks the payload and sets the commit status `macos (runners-1)` on that oneTake commit to pending;
+#   macos:  calls oneTake's own mpvfx-macos.yml on that commit (package and test shards), with no secrets, so the disk
+#           image is ad-hoc signed and nothing here can notarize or log in to Apple;
+#   report: sets the status to the result and, for a nightly that passed, uploads the disk image into oneTake's
+#           nightly-<short sha> release (created if oneTake's publish job has not made it yet).
+#
+# Secrets: RUNNERS_APP_ID and RUNNERS_APP_PRIVATE_KEY, the oneTake-Runners1 App, installed on this repository and on
+# marshiyar/oneTake. Only start and report use them; the build jobs, which run oneTake's code, never see a token.
+
+on:
+  repository_dispatch:
+    types: [onetake-macos]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: onetake-macos-${{ github.event.client_payload.sha }}
+  cancel-in-progress: false
+
+env:
+  SOURCE: marshiyar/oneTake
+  CONTEXT: macos (runners-1)
+
+jobs:
+  start:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.check.outputs.sha }}
+      kind: ${{ steps.check.outputs.kind }}
+    steps:
+      - name: Check the payload
+        id: check
+        env:
+          REPO: ${{ github.event.client_payload.repository }}
+          SHA: ${{ github.event.client_payload.sha }}
+          KIND: ${{ github.event.client_payload.kind }}
+        run: |
+          [ "$REPO" = "$SOURCE" ] || { echo "::error::payload repository '$REPO' is not $SOURCE"; exit 1; }
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::payload sha is not a full commit sha"; exit 1; }
+          case "$KIND" in nightly|pr) ;; *) echo "::error::payload kind '$KIND' is not nightly or pr"; exit 1 ;; esac
+          { echo "sha=$SHA"; echo "kind=$KIND"; } >> "$GITHUB_OUTPUT"
+      - name: oneTake App token
+        id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.RUNNERS_APP_ID }}
+          private-key: ${{ secrets.RUNNERS_APP_PRIVATE_KEY }}
+          owner: marshiyar
+          repositories: oneTake
+          permission-statuses: write
+      - name: Status pending
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          SHA: ${{ steps.check.outputs.sha }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh api -X POST "repos/$SOURCE/statuses/$SHA" -f state=pending -f context="$CONTEXT" \
+            -f description="building on OneTake-actionRunners-1" -f target_url="$RUN" > /dev/null
+
+  macos:
+    needs: start
+    uses: marshiyar/oneTake/.github/workflows/mpvfx-macos.yml@main
+    with:
+      source_repository: marshiyar/oneTake
+      source_ref: ${{ needs.start.outputs.sha }}
+
+  report:
+    needs: [start, macos]
+    if: always() && needs.start.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: oneTake App token
+        id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.RUNNERS_APP_ID }}
+          private-key: ${{ secrets.RUNNERS_APP_PRIVATE_KEY }}
+          owner: marshiyar
+          repositories: oneTake
+          permission-statuses: write
+          permission-contents: write   # the nightly release upload
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: needs.macos.result == 'success' && needs.start.outputs.kind == 'nightly'
+        with:
+          path: dist
+          name: macos
+      - name: Disk image into the nightly release
+        if: needs.macos.result == 'success' && needs.start.outputs.kind == 'nightly'
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          GH_REPO: marshiyar/oneTake
+          SHA: ${{ needs.start.outputs.sha }}
+        run: |
+          shopt -s nullglob
+          files=(dist/*.dmg dist/*-smoke.png)
+          [ "${#files[@]}" -gt 0 ] || { echo "::error::the macos artifact has no disk image"; exit 1; }
+          tag="nightly-${SHA:0:7}"
+          # oneTake's publish job usually made the release already; if not, make it the same way (publish.sh).
+          gh release view "$tag" > /dev/null 2>&1 || gh release create "$tag" --prerelease --latest=false \
+            --target "$SHA" --title "oneTake nightly $(date -u +%Y-%m-%d) (${SHA:0:7})" \
+            --notes "Untested development build from main: installers from every green CI run of main, not an official release.
+
+          Commit: https://github.com/$GH_REPO/commit/$SHA" || { sleep 5; gh release view "$tag" > /dev/null; }
+          gh release upload "$tag" "${files[@]}" --clobber
+      - name: Status result
+        if: always() && steps.token.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          SHA: ${{ needs.start.outputs.sha }}
+          RESULT: ${{ needs.macos.result }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          case "$RESULT" in
+            success) state=success desc="macOS build and tests passed" ;;
+            cancelled) state=error desc="macOS run was cancelled" ;;
+            *) state=failure desc="macOS ended $RESULT" ;;
+          esac
+          gh api -X POST "repos/$SOURCE/statuses/$SHA" -f state="$state" -f context="$CONTEXT" \
+            -f description="$desc" -f target_url="$RUN" > /dev/null
