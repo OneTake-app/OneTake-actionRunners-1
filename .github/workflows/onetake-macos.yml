@@ -4,7 +4,8 @@ name: onetake-macos
 # pool from the oneTake owner's, so macOS work no longer queues behind oneTake's own jobs.
 #
 # oneTake's mpvfx-ci.yml (job macos-runners) sends a repository_dispatch `onetake-macos` with the commit to build and
-# whether it is a main push (kind nightly) or a labelled pull request (kind pr). This workflow:
+# whether it is a main push or the nightly run (kind nightly; the nightly run also sends full: true, every test shard)
+# or a labelled pull request (kind pr). This workflow:
 #   start:  checks the payload and sets the commit status `macos (runners-1)` on that oneTake commit to pending;
 #   macos:  calls oneTake's mpvfx-macos-source.yml (generated from mpvfx-macos.yml: no caches, no secrets) on that commit (package and test shards), with no secrets, so the disk
 #           image is ad-hoc signed and nothing here can notarize or log in to Apple;
@@ -36,6 +37,7 @@ jobs:
     outputs:
       sha: ${{ steps.check.outputs.sha }}
       kind: ${{ steps.check.outputs.kind }}
+      full: ${{ steps.check.outputs.full }}
     steps:
       - name: Check the payload
         id: check
@@ -43,13 +45,17 @@ jobs:
           REPO: ${{ github.event.client_payload.repository }}
           SHA: ${{ github.event.client_payload.sha }}
           KIND: ${{ github.event.client_payload.kind }}
+          FULL: ${{ github.event.client_payload.full }}
         run: |
           [ "$REPO" = "$SOURCE" ] || { echo "::error::payload repository '$REPO' is not $SOURCE"; exit 1; }
           [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::payload sha is not a full commit sha"; exit 1; }
           case "$KIND" in nightly|pr) ;; *) echo "::error::payload kind '$KIND' is not nightly or pr"; exit 1 ;; esac
-          { echo "sha=$SHA"; echo "kind=$KIND"; } >> "$GITHUB_OUTPUT"
+          # full: true from oneTake's nightly run (every test shard); absent from older senders, read as false.
+          case "$FULL" in true) ;; false|'') FULL=false ;; *) echo "::error::payload full '$FULL' is not true or false"; exit 1 ;; esac
+          { echo "sha=$SHA"; echo "kind=$KIND"; echo "full=$FULL"; } >> "$GITHUB_OUTPUT"
       - name: oneTake App token
         id: token
+        continue-on-error: true   # not installed on marshiyar/oneTake: the work still runs, without statuses
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           app-id: ${{ secrets.RUNNERS_APP_ID }}
@@ -58,6 +64,7 @@ jobs:
           repositories: oneTake
           permission-statuses: write
       - name: Status pending
+        if: steps.token.outcome == 'success'
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
           SHA: ${{ steps.check.outputs.sha }}
@@ -72,6 +79,7 @@ jobs:
     with:
       source_repository: marshiyar/oneTake
       source_ref: ${{ needs.start.outputs.sha }}
+      full_tests: ${{ needs.start.outputs.full == 'true' }}
 
   report:
     needs: [start, macos]
@@ -81,6 +89,7 @@ jobs:
     steps:
       - name: oneTake App token
         id: token
+        continue-on-error: true   # not installed on marshiyar/oneTake: the work still runs, without statuses
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           app-id: ${{ secrets.RUNNERS_APP_ID }}
@@ -90,12 +99,12 @@ jobs:
           permission-statuses: write
           permission-contents: write   # the nightly release upload
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        if: needs.macos.result == 'success' && needs.start.outputs.kind == 'nightly'
+        if: steps.token.outcome == 'success' && needs.macos.result == 'success' && needs.start.outputs.kind == 'nightly'
         with:
           path: dist
           name: macos
       - name: Disk image into the nightly release
-        if: needs.macos.result == 'success' && needs.start.outputs.kind == 'nightly'
+        if: steps.token.outcome == 'success' && needs.macos.result == 'success' && needs.start.outputs.kind == 'nightly'
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
           GH_REPO: marshiyar/oneTake
@@ -112,6 +121,9 @@ jobs:
 
           Commit: https://github.com/$GH_REPO/commit/$SHA" || { sleep 5; gh release view "$tag" > /dev/null; }
           gh release upload "$tag" "${files[@]}" --clobber
+      - name: No token, no status or nightly upload
+        if: steps.token.outcome != 'success'
+        run: echo "::warning::no oneTake-Runners1 App token for marshiyar/oneTake (is the App installed on that repository?); the macOS build ran here, but status or nightly upload was not set"
       - name: Status result
         if: always() && steps.token.outcome == 'success'
         env:
